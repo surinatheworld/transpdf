@@ -1,0 +1,15 @@
+# ==========================================
+# TransPDF - Dịch PDF Anh → Việt
+# ==========================================
+# Cài đặt: pip install -r requirements.txt
+# Chạy:    streamlit run app.py
+# ==========================================
+
+# Giao diện web
+streamlit>=1.28.0
+
+# Xử lý PDF (đọc/ghi, trích xuất text, tạo PDF mới)
+PyMuPDF>=1.23.0
+
+# Dịch thuật miễn phí qua Google Translate
+deep-translator>=1.11.0
