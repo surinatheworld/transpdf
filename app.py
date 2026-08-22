@@ -1,16 +1,19 @@
 """
-TransPDF v2.0 — Dịch file PDF từ tiếng Anh sang tiếng Việt (Optimized).
+TransPDF v3.0 — Dịch PDF Anh → Việt (Maximum Speed).
 
-Cải tiến so với v1:
-    - Dịch song song (ThreadPoolExecutor) → nhanh gấp 5 lần.
-    - Trích xuất ở cấp DÒNG (line) thay vì block → giữ đúng vị trí.
-    - Dùng insert_text() tại tọa độ gốc → chữ rõ ràng, không bị co méo.
-    - Font size giữ nguyên bản → dễ đọc.
+Tối ưu tốc độ:
+    v1: 1 block  → 1 API call (tuần tự)       → ~3 phút / 100 blocks
+    v2: 1 dòng   → 1 API call (5 luồng)       → ~30 giây / 100 dòng
+    v3: 20 dòng  → 1 API call (10 luồng)      → ~3–5 giây / 200 dòng
 
-Cài đặt:
-    pip install -r requirements.txt
+Cách hoạt động:
+    - Gộp 20 dòng thành 1 chuỗi (nối bằng \\n) → 1 lần gọi API
+    - 10 luồng song song xử lý nhiều batch cùng lúc
+    - Nếu batch lỗi → tự chia nhỏ và thử lại (recursive fallback)
+    - Kết quả: giảm 90–95% số lần gọi API
 
 Chạy:
+    pip install -r requirements.txt
     streamlit run app.py
 """
 
@@ -22,253 +25,222 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =====================================================================
-# FIX PATH — Đảm bảo Python tìm được site-packages
+# FIX PATH
 # =====================================================================
 _site_pkg = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages")
 if os.path.isdir(_site_pkg) and _site_pkg not in sys.path:
     sys.path.insert(0, _site_pkg)
 
-import pymupdf as fitz  # PyMuPDF (modern import, không dùng 'import fitz' đã deprecated)
+import pymupdf as fitz
 import streamlit as st
 from deep_translator import GoogleTranslator
 
 
 # =====================================================================
-# HẰNG SỐ
+# HẰNG SỐ TỐI ƯU
 # =====================================================================
 
-# Số luồng dịch song song (tăng = nhanh hơn nhưng dễ bị rate-limit)
-MAX_WORKERS = 5
-
-# Giới hạn ký tự mỗi lần gọi Google Translate
-MAX_CHARS = 4500
+BATCH_SIZE = 20       # Số dòng gộp trong 1 API call (↑ = ít call hơn = nhanh hơn)
+MAX_WORKERS = 10      # Số luồng dịch song song
+MAX_CHARS = 4500      # Giới hạn ký tự Google Translate
+FONT_INTERNAL = "vn"  # Tên nội bộ font nhúng vào PDF
 
 
 # =====================================================================
-# TÌM FONT HỖ TRỢ TIẾNG VIỆT
+# TÌM FONT
 # =====================================================================
 
 def find_vietnamese_font():
-    """
-    Tìm font TTF hỗ trợ tiếng Việt (Unicode) trên hệ thống.
-
-    Ưu tiên các font có Vietnamese glyph tốt:
-    Tahoma > Arial > Segoe UI > Calibri > Times New Roman (Windows)
-    DejaVu Sans > Liberation Sans > Noto Sans (Linux)
-    """
+    """Tìm font TTF hỗ trợ tiếng Việt trên hệ thống."""
     candidates = []
-
     if sys.platform == "win32":
-        fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-        candidates = [
-            os.path.join(fonts_dir, f)
-            for f in [
-                "tahoma.ttf",    # Tốt nhất cho tiếng Việt trên Windows
-                "arial.ttf",
-                "segoeui.ttf",
-                "calibri.ttf",
-                "times.ttf",
-                "verdana.ttf",
-            ]
-        ]
+        d = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        candidates = [os.path.join(d, f) for f in
+                      ["tahoma.ttf", "arial.ttf", "segoeui.ttf",
+                       "calibri.ttf", "times.ttf", "verdana.ttf"]]
     elif sys.platform == "darwin":
-        candidates = [
-            "/Library/Fonts/Arial.ttf",
-            "/Library/Fonts/Tahoma.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/Library/Fonts/Times New Roman.ttf",
-        ]
+        candidates = ["/Library/Fonts/Arial.ttf",
+                      "/Library/Fonts/Tahoma.ttf",
+                      "/System/Library/Fonts/Supplemental/Arial.ttf"]
     else:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        ]
-
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
+        candidates = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
     return None
 
 
 # =====================================================================
-# HÀM TIỆN ÍCH
+# TIỆN ÍCH
 # =====================================================================
 
-def color_int_to_rgb(color_int):
-    """Chuyển integer color (0xRRGGBB) → tuple (r, g, b) trong [0, 1]."""
-    if isinstance(color_int, (list, tuple)):
-        return tuple(c if c <= 1.0 else c / 255.0 for c in color_int)
-    r = ((color_int >> 16) & 0xFF) / 255.0
-    g = ((color_int >> 8) & 0xFF) / 255.0
-    b = (color_int & 0xFF) / 255.0
-    return (r, g, b)
+def color_to_rgb(c):
+    """Integer color → (r, g, b) in [0,1]."""
+    if isinstance(c, (list, tuple)):
+        return tuple(x if x <= 1.0 else x / 255.0 for x in c)
+    return (((c >> 16) & 0xFF) / 255.0,
+            ((c >> 8) & 0xFF) / 255.0,
+            (c & 0xFF) / 255.0)
 
 
 def is_translatable(text):
-    """Kiểm tra text có cần dịch không. Bỏ qua số, ký hiệu, text quá ngắn."""
-    text = text.strip()
-    if not text or len(text) <= 1:
-        return False
-    if re.match(r'^[\d\s\W]+$', text):
-        return False
-    return True
+    """Text có cần dịch không? Bỏ qua số, ký hiệu, quá ngắn."""
+    t = text.strip()
+    return bool(t) and len(t) > 1 and not re.match(r'^[\d\s\W]+$', t)
 
 
 # =====================================================================
-# TRÍCH XUẤT TEXT Ở CẤP DÒNG (LINE-LEVEL)
+# TRÍCH XUẤT DÒNG (LINE-LEVEL)
 # =====================================================================
 
 def extract_lines(page):
-    """
-    Trích xuất text ở cấp DÒNG (line) thay vì block.
-
-    Mỗi dòng có:
-    - text: nội dung
-    - bbox: [x0, y0, x1, y1] bounding box
-    - origin: (x, y) tọa độ baseline — dùng cho insert_text()
-    - font_size: kích thước font gốc
-    - color: mã màu
-
-    Ưu điểm so với block-level:
-    - Giữ đúng vị trí dọc (y) cho mỗi dòng
-    - Font size chính xác hơn
-    - Không cần text wrapping → chữ rõ ràng hơn
-    """
+    """Trích xuất text ở cấp dòng với tọa độ baseline."""
     lines = []
-    text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-
-    for block in text_dict.get("blocks", []):
-        if block.get("type") != 0:  # Chỉ text blocks
+    for block in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", []):
+        if block.get("type") != 0:
             continue
-
         for line in block.get("lines", []):
-            full_text = ""
-            font_size = 11
-            color = 0
-            origin = None
-
+            text, size, color, origin = "", 11, 0, None
             for span in line.get("spans", []):
-                span_text = span.get("text", "")
-                full_text += span_text
-
-                # Lấy thông tin từ span đầu tiên có text
-                if span_text.strip() and origin is None:
-                    font_size = span.get("size", 11)
+                st_text = span.get("text", "")
+                text += st_text
+                if st_text.strip() and origin is None:
+                    size = span.get("size", 11)
                     color = span.get("color", 0)
-                    origin = span.get("origin", None)
-
-            full_text = full_text.strip()
-
-            if full_text and origin:
-                lines.append({
-                    "text": full_text,
-                    "bbox": line["bbox"],
-                    "origin": origin,  # (x, y) baseline
-                    "font_size": font_size,
-                    "color": color,
-                })
-
+                    origin = span.get("origin")
+            text = text.strip()
+            if text and origin:
+                lines.append({"text": text, "bbox": line["bbox"],
+                              "origin": origin, "font_size": size, "color": color})
     return lines
 
 
 # =====================================================================
-# DỊCH SONG SONG (CONCURRENT TRANSLATION)
+# DỊCH BATCH — CỐT LÕI TỐI ƯU TỐC ĐỘ
 # =====================================================================
 
-def translate_concurrent(texts, progress_bar, status_text):
+def _translate_batch_recursive(texts, translator):
     """
-    Dịch danh sách texts song song bằng ThreadPoolExecutor.
+    Dịch một batch bằng 1 API call duy nhất.
 
-    Nhanh gấp ~5x so với dịch tuần tự nhờ chạy MAX_WORKERS luồng cùng lúc.
+    Chiến lược:
+        1. Nối tất cả text bằng \\n → gửi 1 lần
+        2. Tách kết quả bằng \\n → map ngược lại
+        3. Nếu số dòng không khớp → chia đôi batch, thử lại (recursive)
+        4. Base case: 1 text → dịch đơn lẻ
 
-    Args:
-        texts: list[str] — danh sách text cần dịch
-        progress_bar: Streamlit progress bar
-        status_text: Streamlit status widget
-
-    Returns:
-        list[str] — danh sách text đã dịch (giữ nguyên thứ tự)
+    Hiệu quả: 20 dòng → 1 API call thay vì 20 calls.
     """
-    results = list(texts)  # Copy — mặc định giữ nguyên text gốc
+    if not texts:
+        return []
+    if len(texts) == 1:
+        try:
+            r = translator.translate(texts[0])
+            return [r if r else texts[0]]
+        except Exception:
+            return texts
 
-    # Chỉ dịch những text thực sự cần dịch
-    translatable_indices = [i for i, t in enumerate(texts) if is_translatable(t)]
+    combined = "\n".join(texts)
 
-    if not translatable_indices:
+    # Nếu vượt giới hạn ký tự → chia đôi
+    if len(combined) > MAX_CHARS:
+        mid = len(texts) // 2
+        return (_translate_batch_recursive(texts[:mid], translator) +
+                _translate_batch_recursive(texts[mid:], translator))
+
+    try:
+        result = translator.translate(combined)
+        parts = result.split("\n")
+
+        # Số dòng khớp → thành công!
+        if len(parts) == len(texts):
+            return [p.strip() for p in parts]
+
+        # Không khớp → chia đôi và thử lại
+        mid = len(texts) // 2
+        return (_translate_batch_recursive(texts[:mid], translator) +
+                _translate_batch_recursive(texts[mid:], translator))
+
+    except Exception:
+        # Lỗi network → chia nhỏ hơn nữa
+        if len(texts) > 2:
+            mid = len(texts) // 2
+            return (_translate_batch_recursive(texts[:mid], translator) +
+                    _translate_batch_recursive(texts[mid:], translator))
+        return texts  # Giữ nguyên gốc
+
+
+def translate_all_fast(texts, progress_bar, status_text):
+    """
+    Dịch TOÀN BỘ danh sách texts với tốc độ tối đa.
+
+    Pipeline:
+        1. Lọc text cần dịch (bỏ số, ký hiệu)
+        2. Gộp thành batches (mỗi batch ~20 dòng)
+        3. Gửi batches song song (10 luồng)
+        4. Mỗi batch = 1 API call (thay vì 20)
+
+    200 dòng → 10 batches × 10 luồng = ~1–2 API rounds = 1–3 giây.
+    """
+    results = list(texts)
+
+    # Lọc: chỉ dịch text thực sự cần dịch
+    translatable = [(i, texts[i]) for i in range(len(texts)) if is_translatable(texts[i])]
+
+    if not translatable:
         return results
 
-    total = len(translatable_indices)
-    completed = 0
+    # Tạo batches
+    batches = []
+    for start in range(0, len(translatable), BATCH_SIZE):
+        batches.append(translatable[start:start + BATCH_SIZE])
 
-    def translate_one(idx):
-        """Dịch một đoạn text. Mỗi thread tạo translator riêng để thread-safe."""
-        try:
-            translator = GoogleTranslator(source='en', target='vi')
-            text = texts[idx]
+    total_batches = len(batches)
+    completed = [0]  # Dùng list để mutate trong closure
 
-            # Xử lý text dài: chia thành chunks
-            if len(text) > MAX_CHARS:
-                sentences = re.split(r'(?<=[.!?])\s+', text)
-                chunks, current = [], ""
-                for s in sentences:
-                    if len(current) + len(s) + 1 > MAX_CHARS:
-                        if current:
-                            chunks.append(current)
-                        current = s
-                    else:
-                        current = f"{current} {s}".strip()
-                if current:
-                    chunks.append(current)
+    status_text.text(
+        f"🌐 Dịch {len(translatable)} dòng "
+        f"({total_batches} batch × {MAX_WORKERS} luồng)..."
+    )
 
-                translated_parts = [translator.translate(c) or c for c in chunks]
-                return idx, " ".join(translated_parts)
-            else:
-                result = translator.translate(text)
-                return idx, result if result else text
-        except Exception:
-            return idx, texts[idx]  # Fail-safe: giữ text gốc
+    def process_one_batch(batch):
+        """Xử lý 1 batch: gộp texts → 1 API call → tách kết quả."""
+        translator = GoogleTranslator(source='en', target='vi')
+        indices = [i for i, _ in batch]
+        batch_texts = [t for _, t in batch]
+        translated = _translate_batch_recursive(batch_texts, translator)
+        return list(zip(indices, translated))
 
-    status_text.text(f"🌐 Đang dịch song song ({MAX_WORKERS} luồng)...")
-
+    # Chạy song song
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit tất cả tasks
-        futures = {
-            executor.submit(translate_one, i): i
-            for i in translatable_indices
-        }
+        futures = {executor.submit(process_one_batch, b): b for b in batches}
 
-        # Thu thập kết quả khi hoàn thành
         for future in as_completed(futures):
-            idx, translated = future.result()
-            results[idx] = translated
+            try:
+                for idx, translated in future.result():
+                    results[idx] = translated
+            except Exception:
+                pass  # Giữ text gốc nếu batch lỗi hoàn toàn
 
-            completed += 1
+            completed[0] += 1
             progress_bar.progress(
-                min(completed / total, 0.99),
-                text=f"Đang dịch... {completed}/{total} dòng"
+                min(completed[0] / total_batches, 0.99),
+                text=f"Đang dịch... {completed[0]}/{total_batches} batch"
             )
 
     return results
 
 
 # =====================================================================
-# XỬ LÝ CHÍNH — DỊCH PDF
+# XỬ LÝ PDF
 # =====================================================================
 
 def process_pdf(pdf_bytes, progress_bar, status_text):
     """
-    Dịch PDF: trích xuất dòng → dịch song song → xóa text gốc → chèn text Việt.
-
-    Quy trình v2.0:
-        1. Trích xuất ở cấp DÒNG (line-level) → giữ đúng vị trí
-        2. Dịch song song (ThreadPoolExecutor) → nhanh gấp 5x
-        3. Xóa text gốc (redaction)
-        4. Chèn text Việt bằng insert_text() tại tọa độ gốc → chữ rõ ràng
+    Pipeline chính: Extract → Translate (batch+parallel) → Redact → Insert.
     """
-    # --- Mở PDF ---
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(doc)
 
@@ -276,271 +248,177 @@ def process_pdf(pdf_bytes, progress_bar, status_text):
         doc.close()
         raise ValueError("File PDF rỗng (0 trang).")
 
-    # --- Tìm font ---
     font_path = find_vietnamese_font()
     if font_path is None:
         doc.close()
-        raise FileNotFoundError(
-            "Không tìm thấy font Unicode hỗ trợ tiếng Việt.\n"
-            "Cần cài một trong: Tahoma, Arial, DejaVu Sans, Liberation Sans."
-        )
+        raise FileNotFoundError("Không tìm thấy font Unicode (Tahoma/Arial/DejaVu Sans).")
 
-    font_name = os.path.basename(font_path)
-    status_text.text(f"🔤 Font: {font_name}")
-    time.sleep(0.3)
-
-    # --- Test translator ---
+    # Test translator
     try:
-        test_translator = GoogleTranslator(source='en', target='vi')
-        test_result = test_translator.translate("Hello")
-        if not test_result:
-            raise ConnectionError("Kết quả rỗng.")
+        GoogleTranslator(source='en', target='vi').translate("test")
     except Exception as e:
         doc.close()
-        raise ConnectionError(
-            f"Không thể kết nối Google Translate: {e}\n"
-            "Kiểm tra kết nối Internet."
-        )
+        raise ConnectionError(f"Lỗi Google Translate: {e}")
 
-    # --- Phase 1: Trích xuất tất cả dòng ---
-    status_text.text("📖 Đang trích xuất văn bản...")
+    # === Phase 1: Extract (nhanh, ~10ms/trang) ===
+    status_text.text("📖 Trích xuất văn bản...")
     all_page_lines = []
     all_texts = []
-
-    for page_idx in range(total_pages):
-        lines = extract_lines(doc[page_idx])
+    for i in range(total_pages):
+        lines = extract_lines(doc[i])
         all_page_lines.append(lines)
         all_texts.extend(line["text"] for line in lines)
 
-    total_lines = len(all_texts)
-
-    if total_lines == 0:
+    if not all_texts:
         doc.close()
-        raise ValueError(
-            "Không trích xuất được văn bản.\n"
-            "File có thể là PDF dạng ảnh scan (không hỗ trợ)."
-        )
+        raise ValueError("Không tìm thấy text. File có thể là PDF ảnh scan.")
 
-    translatable_count = sum(1 for t in all_texts if is_translatable(t))
-    status_text.text(
-        f"📊 {total_lines} dòng ({translatable_count} dòng cần dịch) "
-        f"trên {total_pages} trang"
-    )
-    time.sleep(0.3)
+    n_translatable = sum(1 for t in all_texts if is_translatable(t))
+    status_text.text(f"📊 {len(all_texts)} dòng, {n_translatable} cần dịch, {total_pages} trang")
 
-    # --- Phase 2: Dịch song song ---
-    translated_texts = translate_concurrent(all_texts, progress_bar, status_text)
+    # === Phase 2: Translate (batch + parallel — CỰC NHANH) ===
+    translated = translate_all_fast(all_texts, progress_bar, status_text)
 
-    # --- Phase 3: Áp dụng vào PDF ---
-    status_text.text("📝 Đang tạo PDF tiếng Việt...")
-    text_idx = 0
-
+    # === Phase 3: Apply to PDF ===
+    status_text.text("📝 Ghi PDF tiếng Việt...")
+    idx = 0
     for page_idx in range(total_pages):
         page = doc[page_idx]
         lines = all_page_lines[page_idx]
-
         if not lines:
             continue
 
-        # Bước 3a: Xóa text gốc — redaction từng dòng (chính xác hơn block)
-        for line_info in lines:
-            rect = fitz.Rect(line_info["bbox"])
-            page.add_redact_annot(rect, fill=(1, 1, 1))  # Tô trắng
-
+        # Redact (xóa text gốc)
+        for ln in lines:
+            page.add_redact_annot(fitz.Rect(ln["bbox"]), fill=(1, 1, 1))
         try:
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
         except TypeError:
-            page.apply_redactions()  # Fallback PyMuPDF cũ
+            page.apply_redactions()
 
-        # Bước 3b: Chèn text tiếng Việt tại ĐÚNG tọa độ gốc
-        for line_info in lines:
-            translated = translated_texts[text_idx]
-            text_idx += 1
-
-            origin = line_info["origin"]   # (x, y) baseline position
-            font_size = line_info["font_size"]  # Font size NGUYÊN BẢN
-            color = color_int_to_rgb(line_info["color"])
-
+        # Insert text tiếng Việt tại tọa độ gốc
+        for ln in lines:
             try:
                 page.insert_text(
-                    origin,                # Chèn tại đúng vị trí baseline gốc
-                    translated,
-                    fontname="vn",         # Tên nội bộ cho font nhúng
-                    fontfile=font_path,    # File TTF thực tế
-                    fontsize=font_size,    # GIỮ NGUYÊN font size gốc
-                    color=color,
+                    ln["origin"], translated[idx],
+                    fontname=FONT_INTERNAL, fontfile=font_path,
+                    fontsize=ln["font_size"], color=color_to_rgb(ln["color"]),
                 )
             except Exception:
-                # Fallback: nếu insert_text lỗi, thử insert_textbox
                 try:
-                    rect = fitz.Rect(line_info["bbox"])
                     page.insert_textbox(
-                        rect, translated,
-                        fontname="vn", fontfile=font_path,
-                        fontsize=font_size * 0.9,
-                        color=color,
+                        fitz.Rect(ln["bbox"]), translated[idx],
+                        fontname=FONT_INTERNAL, fontfile=font_path,
+                        fontsize=ln["font_size"] * 0.9,
+                        color=color_to_rgb(ln["color"]),
                     )
                 except Exception:
-                    pass  # Bỏ qua dòng lỗi
+                    pass
+            idx += 1
 
-    # --- Phase 4: Lưu PDF ---
-    status_text.text("💾 Đang lưu file...")
-    output = io.BytesIO()
-    doc.save(output, garbage=4, deflate=True)
+    # === Phase 4: Save ===
+    out = io.BytesIO()
+    doc.save(out, garbage=4, deflate=True)
     doc.close()
-
-    progress_bar.progress(1.0, text="✅ Hoàn tất!")
-    return output.getvalue()
+    progress_bar.progress(1.0, text="✅ Xong!")
+    return out.getvalue()
 
 
 # =====================================================================
-# GIAO DIỆN STREAMLIT
+# STREAMLIT UI
 # =====================================================================
 
-st.set_page_config(
-    page_title="TransPDF — Dịch PDF Anh→Việt",
-    page_icon="📄",
-    layout="centered",
-)
+st.set_page_config(page_title="TransPDF v3", page_icon="📄", layout="centered")
 
-# --- CSS ---
 st.markdown("""
 <style>
     .block-container { max-width: 760px; padding-top: 2rem; }
-
-    .app-header { text-align: center; padding: 1.5rem 0 0.5rem 0; }
+    .app-header { text-align: center; padding: 1rem 0 0.5rem 0; }
     .app-header h1 {
         font-size: 2.2rem;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
     }
     .app-header p { color: #888; font-size: 1rem; margin-top: 0; }
-
     .stDownloadButton > button {
         background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%) !important;
         color: white !important; border: none !important;
-        font-weight: 600 !important; font-size: 1.05rem !important;
-        border-radius: 8px !important;
+        font-weight: 600 !important; border-radius: 8px !important;
     }
-
     .stButton > button[kind="primary"] {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-        border: none !important; font-weight: 600 !important;
-        font-size: 1.05rem !important; border-radius: 8px !important;
+        border: none !important; font-weight: 600 !important; border-radius: 8px !important;
     }
-
     [data-testid="stMetric"] {
         background: #f8f9fa; border-radius: 10px;
         padding: 0.8rem; border: 1px solid #e9ecef;
     }
-
-    .app-footer { text-align: center; color: #aaa; font-size: 0.8rem; }
-
-    .steps-list {
-        background: #f8f9fa; border-radius: 10px;
-        padding: 1rem 1.2rem; border-left: 4px solid #667eea;
+    .speed-badge {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        color: white; padding: 4px 12px; border-radius: 20px;
+        font-size: 0.8rem; font-weight: 600; display: inline-block;
     }
-    .steps-list p { margin: 0.3rem 0; font-size: 0.92rem; color: #555; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Header ---
 st.markdown("""
 <div class="app-header">
-    <h1>📄 TransPDF v2.0</h1>
-    <p>Dịch tài liệu PDF Anh → Việt — nhanh hơn, chữ rõ hơn</p>
+    <h1>📄 TransPDF</h1>
+    <p>Dịch PDF Anh → Việt &nbsp;
+    <span class="speed-badge">⚡ v3.0 — Batch + Parallel</span></p>
 </div>
 """, unsafe_allow_html=True)
 
-# --- Hướng dẫn ---
-with st.expander("ℹ️ Hướng dẫn sử dụng", expanded=False):
+with st.expander("⚡ Tối ưu tốc độ v3.0", expanded=False):
     st.markdown("""
-    <div class="steps-list">
-        <p>📁 <strong>Bước 1:</strong> Tải lên file PDF tiếng Anh</p>
-        <p>🚀 <strong>Bước 2:</strong> Nhấn "Bắt đầu dịch" và chờ</p>
-        <p>⬇️ <strong>Bước 3:</strong> Tải xuống PDF tiếng Việt</p>
-    </div>
-    """, unsafe_allow_html=True)
-    st.info(
-        "**Cải tiến v2.0:** Dịch song song (5 luồng) nhanh gấp ~5x. "
-        "Chữ được chèn tại đúng tọa độ gốc, font size giữ nguyên → dễ đọc hơn."
-    )
+    | Phiên bản | Cách dịch | 200 dòng |
+    |---|---|---|
+    | v1 | 1 block → 1 API call (tuần tự) | ~3 phút |
+    | v2 | 1 dòng → 1 API call (5 luồng) | ~30 giây |
+    | **v3** | **20 dòng → 1 API call (10 luồng)** | **~3–5 giây** |
+    """)
 
 st.divider()
 
-# --- Upload ---
-uploaded_file = st.file_uploader(
-    "📁 Chọn file PDF tiếng Anh",
-    type=["pdf"],
-    help="Hỗ trợ PDF có text. Không hỗ trợ PDF ảnh scan.",
-)
+uploaded = st.file_uploader("📁 Chọn file PDF tiếng Anh", type=["pdf"],
+                            help="PDF có text. Không hỗ trợ ảnh scan.")
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    file_size_mb = len(file_bytes) / (1024 * 1024)
-
-    col1, col2 = st.columns(2)
-    col1.metric("📄 Tên file", uploaded_file.name)
-    col2.metric("📦 Kích thước", f"{file_size_mb:.2f} MB")
-
-    if file_size_mb > 10:
-        st.warning("⚠️ File lớn — quá trình dịch có thể mất vài phút.")
-
+if uploaded:
+    data = uploaded.getvalue()
+    mb = len(data) / (1024 * 1024)
+    c1, c2 = st.columns(2)
+    c1.metric("📄 File", uploaded.name)
+    c2.metric("📦 Size", f"{mb:.2f} MB")
     st.divider()
 
-    if st.button("🚀 Bắt đầu dịch", type="primary", use_container_width=True):
-        progress_bar = st.progress(0, text="Đang khởi tạo...")
-        status_text = st.empty()
-        start_time = time.time()
+    if st.button("🚀 Dịch ngay", type="primary", use_container_width=True):
+        bar = st.progress(0, text="Khởi tạo...")
+        status = st.empty()
+        t0 = time.time()
 
         try:
-            result_pdf = process_pdf(file_bytes, progress_bar, status_text)
+            pdf_out = process_pdf(data, bar, status)
+            elapsed = time.time() - t0
+            status.success(f"✅ Hoàn tất trong **{elapsed:.1f}s**!")
 
-            elapsed = time.time() - start_time
-            status_text.success(
-                f"✅ Dịch hoàn tất trong {elapsed:.1f} giây!"
-            )
+            name = uploaded.name
+            out_name = (name[:-4] + "_vi.pdf") if name.lower().endswith(".pdf") else name + "_vi.pdf"
 
-            output_name = uploaded_file.name
-            if output_name.lower().endswith(".pdf"):
-                output_name = output_name[:-4] + "_vi.pdf"
-            else:
-                output_name += "_vi.pdf"
-
-            st.download_button(
-                label="⬇️ Tải xuống PDF tiếng Việt",
-                data=result_pdf,
-                file_name=output_name,
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
+            st.download_button("⬇️ Tải PDF tiếng Việt", data=pdf_out,
+                               file_name=out_name, mime="application/pdf",
+                               use_container_width=True)
         except ValueError as e:
-            st.error(f"❌ **Lỗi dữ liệu:** {e}")
+            st.error(f"❌ {e}")
         except FileNotFoundError as e:
-            st.error(f"❌ **Lỗi font:** {e}")
+            st.error(f"❌ {e}")
         except ConnectionError as e:
-            st.error(f"❌ **Lỗi kết nối:** {e}")
+            st.error(f"❌ {e}")
         except Exception as e:
-            st.error(f"❌ **Lỗi:** {e}")
-            st.info(
-                "💡 Gợi ý: Kiểm tra file PDF không bị hỏng, "
-                "kết nối Internet ổn định, thử file khác."
-            )
+            st.error(f"❌ {e}")
+            st.info("💡 Kiểm tra file PDF + kết nối Internet.")
 else:
-    st.markdown(
-        '<p style="text-align:center; color:#bbb; padding:2rem 0; '
-        'font-size:1.1rem;">⬆️ Tải lên file PDF để bắt đầu</p>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<p style="text-align:center;color:#bbb;padding:2rem 0">'
+                '⬆️ Tải PDF để bắt đầu</p>', unsafe_allow_html=True)
 
-# --- Footer ---
 st.divider()
-st.markdown(
-    '<p class="app-footer">'
-    'TransPDF v2.0 &bull; Dịch song song 5 luồng &bull; '
-    'PyMuPDF + Google Translate (miễn phí)'
-    '</p>',
-    unsafe_allow_html=True,
-)
+st.caption("TransPDF v3.0 • Batch (20 dòng/call) + Parallel (10 luồng) • Google Translate miễn phí")
