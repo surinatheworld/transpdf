@@ -1,79 +1,77 @@
 # 📄 TransPDF — Dịch PDF Anh → Việt
 
-Ứng dụng web dịch file PDF từ tiếng Anh sang tiếng Việt, giữ nguyên bố cục cơ bản của tài liệu gốc.
+Ứng dụng dịch file PDF từ tiếng Anh sang tiếng Việt, giữ nguyên bố cục cơ bản.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-red.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ## ✨ Tính năng
 
-- 📁 Upload file PDF tiếng Anh
-- 🔍 Trích xuất văn bản + tọa độ từ PDF (PyMuPDF)
-- 🌐 Dịch tự động Anh → Việt (Google Translate, miễn phí)
-- 📄 Tạo PDF mới với text tiếng Việt, giữ nguyên bố cục cơ bản
-- 📊 Thanh tiến trình (progress bar) hiển thị trạng thái dịch
-- 🔤 Nhúng font Unicode hỗ trợ tiếng Việt (Arial, Tahoma, DejaVu Sans...)
-- ⬇️ Tải xuống file PDF tiếng Việt đã dịch
-- ⚠️ Xử lý ngoại lệ: file rỗng, PDF scan, lỗi API, thiếu font...
+- ⚡ **Dịch cực nhanh** — batch 20 dòng/API call + 10 luồng song song
+- 📄 Giữ nguyên bố cục cơ bản (vị trí, font size, màu sắc)
+- 🔤 Nhúng font Unicode hỗ trợ tiếng Việt
+- 📊 Thanh tiến trình hiển thị trạng thái
+- ⚠️ Xử lý lỗi: file rỗng, PDF scan, API lỗi, thiếu font
 
-## 🚀 Cài đặt & Chạy
+## 🚀 Cách chạy
 
-### 1. Clone repo
+### Cách 1: Double-click (đơn giản nhất)
+
+```
+1. Cài Python 3.8+ (https://python.org) — chọn "Add to PATH"
+2. Double-click file TransPDF.bat
+3. Chờ cài thư viện (lần đầu) → trình duyệt tự mở
+```
+
+### Cách 2: Dùng file EXE
+
+```
+1. Cài Python 3.8+
+2. Double-click build_exe.bat → tạo file dist/TransPDF.exe
+3. Copy TransPDF.exe + app.py + requirements.txt vào 1 thư mục
+4. Double-click TransPDF.exe để chạy
+```
+
+### Cách 3: Command line
 
 ```bash
 git clone https://github.com/surinatheworld/transpdf.git
 cd transpdf
-```
-
-### 2. Cài đặt dependencies
-
-```bash
 pip install -r requirements.txt
-```
-
-### 3. Chạy ứng dụng
-
-```bash
 streamlit run app.py
 ```
 
-Ứng dụng sẽ mở tại `http://localhost:8501`.
+## 📁 Cấu trúc file
 
-## 📋 Yêu cầu hệ thống
+| File | Mô tả |
+|---|---|
+| `app.py` | Source code chính (Streamlit app) |
+| `requirements.txt` | Thư viện cần cài |
+| `TransPDF.bat` | 🖱️ Double-click để chạy (Windows) |
+| `launcher.py` | Source code launcher (build thành EXE) |
+| `build_exe.bat` | 🔨 Script build file EXE |
 
-- **Python** 3.8+
-- **Kết nối Internet** (để sử dụng Google Translate API miễn phí)
-- **Font Unicode** trên hệ thống (Arial, Tahoma, DejaVu Sans, v.v.)
+## ⚡ Tốc độ
 
-## 🛠️ Thư viện sử dụng
+| Phiên bản | Cách dịch | 200 dòng |
+|---|---|---|
+| v1 | 1 block → 1 API call (tuần tự) | ~3 phút |
+| v2 | 1 dòng → 1 API call (5 luồng) | ~30 giây |
+| **v3** | **20 dòng → 1 API call (10 luồng)** | **~3–5 giây** |
+
+## 🛠️ Thư viện
 
 | Thư viện | Mục đích |
 |---|---|
 | `streamlit` | Giao diện web |
-| `PyMuPDF` | Đọc/ghi PDF, trích xuất text + tọa độ |
-| `deep-translator` | Dịch thuật qua Google Translate (miễn phí) |
-
-## 📖 Luồng hoạt động
-
-```
-Upload PDF (EN) → Trích xuất text blocks + tọa độ
-                        ↓
-              Dịch từng block (EN → VI)
-                        ↓
-              Xóa text gốc (redaction)
-                        ↓
-              Chèn text tiếng Việt vào vị trí cũ
-                        ↓
-              Tải xuống PDF (VI)
-```
+| `PyMuPDF` | Đọc/ghi PDF |
+| `deep-translator` | Google Translate (miễn phí) |
 
 ## ⚠️ Lưu ý
 
-- Chỉ hỗ trợ **PDF có text** (text-based). Không hỗ trợ PDF dạng ảnh scan.
-- Sử dụng Google Translate API **miễn phí**, nên có thể bị rate-limit nếu dịch quá nhiều.
-- Bố cục được giữ ở mức **cơ bản** (vị trí block, font size). Các yếu tố phức tạp (bảng, cột, header/footer) có thể không hoàn hảo.
-- Font size của text dịch được tự động giảm để vừa với bounding box gốc (tiếng Việt thường dài hơn tiếng Anh).
+- Chỉ hỗ trợ PDF có text (không hỗ trợ ảnh scan)
+- Cần kết nối Internet (Google Translate API miễn phí)
+- Cần cài Python 3.8+ trên máy
 
 ## 📄 License
 
